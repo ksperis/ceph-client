@@ -80,7 +80,7 @@
 
 /* Features supported by this (client software) implementation. */
 
-#define RBD_FEATURES_SUPPORTED	(0)
+#define RBD_FEATURES_SUPPORTED	(RBD_FEATURES_ALL)
 
 /*
  * An RBD device name will be "rbd#", where the "rbd" comes from
