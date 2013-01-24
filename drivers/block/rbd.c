@@ -209,6 +209,7 @@ struct rbd_obj_request {
 enum img_req_flags {
 	IMG_REQ_WRITE,		/* I/O direction: read = 0, write = 1 */
 	IMG_REQ_CHILD,		/* initiator: block = 0, child image = 1 */
+	IMG_REQ_LAYERED,	/* ENOENT handling: normal = 0, layered = 1 */
 };
 
 struct rbd_img_request {
@@ -256,6 +257,11 @@ struct rbd_img_request {
 	set_bit(IMG_REQ_CHILD, &(img_req)->flags)
 #define img_req_child(img_req) \
 	test_bit(IMG_REQ_CHILD, &(img_req)->flags)
+
+#define img_req_layered_set(img_req) \
+	set_bit(IMG_REQ_LAYERED, &(img_req)->flags)
+#define img_req_layered(img_req) \
+	test_bit(IMG_REQ_LAYERED, &(img_req)->flags)
 
 struct rbd_snap {
 	struct	device		dev;
@@ -1543,6 +1549,8 @@ struct rbd_img_request *rbd_img_request_create(struct rbd_device *rbd_dev,
 	}
 	if (child_request)
 		img_req_child_set(img_request);
+	if (rbd_dev->parent_spec)
+		img_req_layered_set(img_request);
 	spin_lock_init(&img_request->completion_lock);
 	img_request->next_completion = 0;
 	img_request->callback = NULL;
