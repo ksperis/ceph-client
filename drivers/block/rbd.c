@@ -1447,6 +1447,32 @@ static void rbd_osd_req_destroy(struct ceph_osd_request *osd_req)
 	ceph_osdc_put_request(osd_req);
 }
 
+struct ceph_osd_request *rbd_img_obj_osd_req_create(
+				struct rbd_img_request *img_request,
+				struct rbd_obj_request *obj_request)
+{
+	bool write_request = img_req_write(img_request);
+	struct ceph_osd_req_op *op;
+	struct ceph_osd_request	*osd_req;
+	u16 opcode;
+
+	opcode = write_request ? CEPH_OSD_OP_WRITE
+				: CEPH_OSD_OP_READ;
+	/*
+	 * Build up the op to use in building the osd request.  The
+	 * contents of the op are copied by rbd_osd_req_create().
+	 */
+	op = rbd_osd_req_op_create(opcode, obj_request->offset,
+						obj_request->length);
+	if (!op)
+		return NULL;
+	osd_req = rbd_osd_req_create(img_request->rbd_dev, write_request,
+					obj_request, op);
+	rbd_osd_req_op_destroy(op);
+
+	return osd_req;
+}
+
 /* object_name is assumed to be a non-null pointer and NUL-terminated */
 
 static struct rbd_obj_request *rbd_obj_request_create(const char *object_name,
@@ -1589,14 +1615,10 @@ static int rbd_img_request_fill_bio(struct rbd_img_request *img_request,
 	struct rbd_device *rbd_dev = img_request->rbd_dev;
 	struct rbd_obj_request *obj_request = NULL;
 	struct rbd_obj_request *next_obj_request;
-	bool write_request = img_req_write(img_request);
 	unsigned int bio_offset;
 	u64 img_offset;
 	u64 resid;
-	u16 opcode;
 
-	opcode = write_request ? CEPH_OSD_OP_WRITE
-				: CEPH_OSD_OP_READ;
 	bio_offset = 0;
 	img_offset = img_request->offset;
 	rbd_assert(img_offset == bio_list->bi_sector << SECTOR_SHIFT);
@@ -1604,7 +1626,6 @@ static int rbd_img_request_fill_bio(struct rbd_img_request *img_request,
 	while (resid) {
 		const char *object_name;
 		unsigned int clone_size;
-		struct ceph_osd_req_op *op;
 		u64 offset;
 		u64 length;
 
@@ -1628,18 +1649,8 @@ static int rbd_img_request_fill_bio(struct rbd_img_request *img_request,
 		if (!obj_request->bio_list)
 			goto out_partial;
 
-		/*
-		 * Build up the op to use in building the osd
-		 * request.  Note that the contents of the op are
-		 * copied by rbd_osd_req_create().
-		 */
-		op = rbd_osd_req_op_create(opcode, offset, length);
-		if (!op)
-			goto out_partial;
-		obj_request->osd_req = rbd_osd_req_create(rbd_dev,
-						write_request,
-						obj_request, op);
-		rbd_osd_req_op_destroy(op);
+		obj_request->osd_req = rbd_img_obj_osd_req_create(img_request,
+								obj_request);
 		if (!obj_request->osd_req)
 			goto out_partial;
 		/* status and version are initially zero-filled */
