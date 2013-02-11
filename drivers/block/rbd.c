@@ -176,6 +176,7 @@ enum obj_request_type {
 
 enum obj_req_flags {
 	OBJ_REQ_DONE,		/* completion flag: not done = 0, done = 1 */
+	OBJ_REQ_IMG_DATA,	/* object usage: standalone = 0, image = 1 */
 };
 
 struct rbd_obj_request {
@@ -219,6 +220,13 @@ struct rbd_obj_request {
 	set_bit(OBJ_REQ_DONE, &(obj_req)->flags)
 #define obj_req_done(obj_req) \
 	test_bit(OBJ_REQ_DONE, &(obj_req)->flags)
+
+#define obj_req_img_data_set(obj_req) \
+	set_bit(OBJ_REQ_IMG_DATA, &(obj_req)->flags)
+#define obj_req_img_data_clr(obj_req) \
+	clear_bit(OBJ_REQ_IMG_DATA, &(obj_req)->flags)
+#define obj_req_img_data(obj_req) \
+	test_bit(OBJ_REQ_IMG_DATA, &(obj_req)->flags)
 
 enum img_req_flags {
 	IMG_REQ_WRITE,		/* I/O direction: read = 0, write = 1 */
@@ -1149,6 +1157,8 @@ static inline void rbd_img_obj_request_add(struct rbd_img_request *img_request,
 	rbd_obj_request_get(obj_request);
 	obj_request->img_request = img_request;
 	obj_request->which = img_request->obj_request_count;
+	rbd_assert(!obj_req_img_data(obj_request));
+	obj_req_img_data_set(obj_request);
 	rbd_assert(obj_request->which != BAD_WHICH);
 	img_request->obj_request_count++;
 	list_add_tail(&obj_request->links, &img_request->obj_requests);
@@ -1164,6 +1174,8 @@ static inline void rbd_img_obj_request_del(struct rbd_img_request *img_request,
 	img_request->obj_request_count--;
 	rbd_assert(obj_request->which == img_request->obj_request_count);
 	obj_request->which = BAD_WHICH;
+	rbd_assert(obj_req_img_data(obj_request));
+	obj_req_img_data_clr(obj_request);
 	rbd_assert(obj_request->img_request == img_request);
 	obj_request->img_request = NULL;
 	obj_request->callback = NULL;
@@ -1348,7 +1360,8 @@ static void rbd_osd_req_callback(struct ceph_osd_request *osd_req,
 	u16 opcode;
 
 	rbd_assert(osd_req == obj_request->osd_req);
-	rbd_assert(!!obj_request->img_request ^
+	rbd_assert(obj_req_img_data(obj_request) ^ !obj_request->img_request);
+	rbd_assert(obj_req_img_data(obj_request) ^
 				(obj_request->which == BAD_WHICH));
 
 	obj_request->xferred = le32_to_cpu(msg->hdr.data_len);
@@ -1392,7 +1405,6 @@ static struct ceph_osd_request *rbd_osd_req_create(
 					struct rbd_obj_request *obj_request,
 					struct ceph_osd_req_op *op)
 {
-	struct rbd_img_request *img_request = obj_request->img_request;
 	struct ceph_snap_context *snapc = NULL;
 	struct ceph_osd_client *osdc;
 	struct ceph_osd_request *osd_req;
@@ -1402,7 +1414,9 @@ static struct ceph_osd_request *rbd_osd_req_create(
 	u64 offset = obj_request->offset;
 	u64 length = obj_request->length;
 
-	if (img_request) {
+	if (obj_req_img_data(obj_request)) {
+		struct rbd_img_request *img_request = obj_request->img_request;
+
 		rbd_assert(!write_request ^ img_req_write(img_request));
 		if (write_request)
 			snapc = img_request->snapc;
@@ -1528,6 +1542,7 @@ static void rbd_obj_request_destroy(struct kref *kref)
 
 	obj_request = container_of(kref, struct rbd_obj_request, kref);
 
+	rbd_assert(!obj_req_img_data(obj_request));
 	rbd_assert(obj_request->img_request == NULL);
 	rbd_assert(obj_request->which == BAD_WHICH);
 
@@ -1693,10 +1708,12 @@ out_unwind:
 
 static bool rbd_img_obj_end_request(struct rbd_obj_request *obj_request)
 {
-	struct rbd_img_request *img_request = obj_request->img_request;
+	struct rbd_img_request *img_request;
 	unsigned int xferred;
 	int result;
 
+	rbd_assert(obj_req_img_data(obj_request));
+	img_request = obj_request->img_request;
 	if (!img_req_child(img_request))
 		rbd_assert(img_request->rq != NULL);
 
@@ -1725,6 +1742,7 @@ static void rbd_img_obj_callback(struct rbd_obj_request *obj_request)
 	u32 which = obj_request->which;
 	bool more = true;
 
+	rbd_assert(obj_req_img_data(obj_request));
 	img_request = obj_request->img_request;
 	rbd_assert(img_request != NULL);
 	rbd_assert(which != BAD_WHICH);
