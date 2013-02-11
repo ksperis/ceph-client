@@ -178,6 +178,7 @@ enum obj_req_flags {
 	OBJ_REQ_DONE,		/* completion flag: not done = 0, done = 1 */
 	OBJ_REQ_IMG_DATA,	/* object usage: standalone = 0, image = 1 */
 	OBJ_REQ_EXISTS,		/* target exists: no/don't know = 0, yes = 1 */
+	OBJ_REQ_STAT,		/* stat for layered write: no = 0, yes = 1 */
 };
 
 struct rbd_obj_request {
@@ -186,9 +187,28 @@ struct rbd_obj_request {
 	u64			length;		/* bytes from offset */
 	unsigned long		flags;
 
-	struct rbd_img_request	*img_request;
-	u64			img_offset;	/* image relative offset */
-	struct list_head	links;		/* img_request->obj_requests */
+	/*
+	 * A standalone object request will have which == BAD_WHICH
+	 * and a null originator pointer.
+	 *
+	 * An object request initiated in support of a layered image
+	 * object (to check for its existence before a write) will
+	 * have which == BAD_WHICH and a non-null obj_request pointer.
+	 *
+	 * An object request for rbd image data will have a non-null
+	 * img_request pointer, and its which value will be in the
+	 * range 0..(img_request->obj_request_count-1).
+	 */
+	union {
+		void			*originator;
+		struct rbd_obj_request	*obj_request;	/* STAT op */
+		struct {
+			struct rbd_img_request	*img_request;
+			u64			img_offset;
+			/* links for img_request->obj_requests list */
+			struct list_head	links;
+		};
+	};
 	u32			which;		/* posn image request list */
 
 	enum obj_request_type	type;
@@ -234,10 +254,16 @@ struct rbd_obj_request {
 #define obj_req_exists(obj_req) \
 	test_bit(OBJ_REQ_EXISTS, &(obj_req)->flags)
 
+#define obj_req_stat_set(obj_req) \
+	set_bit(OBJ_REQ_STAT, &(obj_req)->flags)
+#define obj_req_stat(obj_req) \
+	test_bit(OBJ_REQ_STAT, &(obj_req)->flags)
+
 enum img_req_flags {
 	IMG_REQ_WRITE,		/* I/O direction: read = 0, write = 1 */
 	IMG_REQ_CHILD,		/* initiator: block = 0, child image = 1 */
 	IMG_REQ_LAYERED,	/* ENOENT handling: normal = 0, layered = 1 */
+	IMG_REQ_STAT,		/* layered write STAT op: no = 0, yes = 1 */
 };
 
 struct rbd_img_request {
