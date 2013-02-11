@@ -2306,6 +2306,89 @@ out:
 	return ret;
 }
 
+/*
+ * Synchronous osd object stat call
+ */
+static int rbd_obj_stat_sync(struct rbd_device *rbd_dev,
+			     const char *object_name,
+			     u64 *object_size, struct timespec *mtime)
+{
+	struct rbd_obj_request *obj_request;
+	struct ceph_osd_client *osdc;
+	struct ceph_osd_req_op *op;
+	struct page **pages;
+	u32 page_count;
+	int ret;
+	struct {
+		__le64	size;
+		struct {
+			__le32	tv_sec;
+			__le32	tv_nsec;
+		}	mtime;
+	} __attribute__ ((packed)) result_buf;
+
+	/*
+	 * A stat call is a read operation but it doesn't involve
+	 * object data (so no offset or length).
+	 */
+	page_count = (u32) calc_pages_for(0, sizeof (result_buf));
+	pages = ceph_alloc_page_vector(page_count, GFP_KERNEL);
+	if (IS_ERR(pages))
+		return PTR_ERR(pages);
+
+	ret = -ENOMEM;
+	obj_request = rbd_obj_request_create(object_name, 0, 0,
+							OBJ_REQUEST_PAGES);
+	if (!obj_request)
+		goto out;
+
+	obj_request->pages = pages;
+	obj_request->page_count = page_count;
+
+	op = rbd_osd_req_op_create(CEPH_OSD_OP_STAT);
+	if (!op)
+		goto out;
+	obj_request->osd_req = rbd_osd_req_create(rbd_dev, false,
+						obj_request, op);
+	rbd_osd_req_op_destroy(op);
+	if (!obj_request->osd_req)
+		goto out;
+
+	osdc = &rbd_dev->rbd_client->client->osdc;
+	ret = rbd_obj_request_submit(osdc, obj_request);
+	if (ret)
+		goto out;
+	ret = rbd_obj_request_wait(obj_request);
+	if (ret)
+		goto out;
+
+	ret = obj_request->result;
+	if (ret < 0)
+		goto out;
+	if (obj_request->xferred < sizeof (result_buf))
+	ceph_copy_from_page_vector(pages, (char *) &result_buf, 0,
+					obj_request->xferred);
+	if (ret >= 0) {
+		if (object_size)
+			*object_size = le64_to_cpu(result_buf.size);
+		if (mtime) {
+			u32 cpu32;
+
+			cpu32 = le32_to_cpu(result_buf.mtime.tv_sec);
+			mtime->tv_sec = (time_t) cpu32;
+			cpu32 = le32_to_cpu(result_buf.mtime.tv_nsec);
+			mtime->tv_nsec = (long) cpu32;
+		}
+	}
+out:
+	if (obj_request)
+		rbd_obj_request_put(obj_request);
+	else
+		ceph_release_page_vector(pages, page_count);
+
+	return ret;
+}
+
 static void rbd_request_fn(struct request_queue *q)
 {
 	struct rbd_device *rbd_dev = q->queuedata;
@@ -4191,6 +4274,18 @@ static int rbd_dev_v1_probe(struct rbd_device *rbd_dev)
 	sprintf(rbd_dev->header_name, "%s%s",
 		rbd_dev->spec->image_name, RBD_SUFFIX);
 
+{
+	u64 object_size = 0;
+	struct timespec mtime = { 0 };
+
+	ret = rbd_obj_stat_sync(rbd_dev, rbd_dev->header_name,
+			&object_size, &mtime);
+	printk("rbd_obj_stat_sync(%s) returned %d\n",
+		rbd_dev->header_name, ret);
+	if (ret >= 0)
+		printk("    size is %llu, mtime = %llu.%09ld\n", object_size,
+			(unsigned long long) mtime.tv_sec, mtime.tv_nsec);
+}
 	/* Populate rbd image metadata */
 
 	ret = rbd_read_header(rbd_dev, &rbd_dev->header);
