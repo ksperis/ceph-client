@@ -177,6 +177,7 @@ enum obj_request_type {
 enum obj_req_flags {
 	OBJ_REQ_DONE,		/* completion flag: not done = 0, done = 1 */
 	OBJ_REQ_IMG_DATA,	/* object usage: standalone = 0, image = 1 */
+	OBJ_REQ_EXISTS,		/* target exists: no/don't know = 0, yes = 1 */
 };
 
 struct rbd_obj_request {
@@ -227,6 +228,11 @@ struct rbd_obj_request {
 	clear_bit(OBJ_REQ_IMG_DATA, &(obj_req)->flags)
 #define obj_req_img_data(obj_req) \
 	test_bit(OBJ_REQ_IMG_DATA, &(obj_req)->flags)
+
+#define obj_req_exists_set(obj_req) \
+	set_bit(OBJ_REQ_EXISTS, &(obj_req)->flags)
+#define obj_req_exists(obj_req) \
+	test_bit(OBJ_REQ_EXISTS, &(obj_req)->flags)
 
 enum img_req_flags {
 	IMG_REQ_WRITE,		/* I/O direction: read = 0, write = 1 */
