@@ -1,4 +1,5 @@
 /*
+ *
    rbd.c -- Export ceph rados objects as a Linux block device
 
 
@@ -389,6 +390,14 @@ enum rbd_dev_flags {
 	RBD_DEV_FLAG_EXISTS,	/* mapped snapshot has not been deleted */
 	RBD_DEV_FLAG_REMOVING,	/* this mapping is being removed */
 };
+
+struct osd_op_stat_result {
+	__le64	size;
+	struct {
+		__le32	tv_sec;
+		__le32	tv_nsec;
+	}	mtime;
+} __attribute__ ((packed));
 
 static DEFINE_MUTEX(ctl_mutex);	  /* Serialize open/close/setup/teardown */
 
@@ -1343,6 +1352,7 @@ static void rbd_obj_request_complete(struct rbd_obj_request *obj_request)
 		obj_request->callback(obj_request);
 	else
 		complete_all(&obj_request->completion);
+	/* XXX Who holds/drops final reference? */
 }
 
 static void rbd_read_finish(struct rbd_obj_request *obj_request, u64 xferred)
@@ -1382,14 +1392,62 @@ static void rbd_osd_write_callback(struct rbd_obj_request *obj_request,
 	obj_request_done_set(obj_request);
 }
 
-/*
- * For a simple stat call there's nothing to do.  We'll do more if
- * this is part of a write sequence for a layered image.
- */
 static void rbd_osd_stat_callback(struct rbd_obj_request *obj_request,
 				struct ceph_osd_op *op)
 {
+	struct rbd_img_request *img_request;
+	struct rbd_obj_request *original_request;
+	struct rbd_device *rbd_dev;
+	struct ceph_osd_client *osdc;
+	int ret;
+
+	/*
+	 * Asynchronous stat requests are simply existence tests.
+	 * We have no place to put the size and mtime information
+	 * returned.
+	 */
+	rbd_assert(obj_request->type == OBJ_REQUEST_PAGES);
+	ceph_release_page_vector(obj_request->pages, obj_request->page_count);
+	if (!obj_req_stat(obj_request)) {
+		obj_request_done_set(obj_request);
+
+		return;
+	}
+
+	original_request = obj_request->obj_request;
+	rbd_assert(original_request != NULL);
+	obj_request->obj_request = NULL;
+	rbd_obj_request_put(original_request);
+
 	obj_request_done_set(obj_request);
+
+	rbd_assert(obj_req_img_data(original_request));
+	img_request = original_request->img_request;
+	rbd_assert(img_request != NULL);
+	rbd_assert(img_req_layered(img_request));
+	rbd_assert(img_req_write(img_request));
+	rbd_dev = img_request->rbd_dev;
+
+	/*
+	 * If it does, then we can proceed with the original write
+	 * request.  We'll get a ENOENT result if it doesn't exist.
+	 * Any other error and we're done.
+	 */
+	printk("%s: layered object \"%s\" stat result: %d\n", __func__,
+		original_request->object_name, original_request->result);
+
+	/* Send the original write through regardless for now */
+
+	osdc = &rbd_dev->rbd_client->client->osdc;
+	ret = rbd_obj_request_submit(osdc, original_request);
+	if (ret) {
+		/*
+		 * XXX How do we communicate this back to original
+		 * request?
+		 */
+		rbd_obj_request_put(original_request);
+		obj_request->result = ret;
+	}
 }
 
 static void rbd_osd_req_callback(struct ceph_osd_request *osd_req,
@@ -1521,6 +1579,50 @@ static void rbd_osd_req_destroy(struct ceph_osd_request *osd_req)
 	ceph_osdc_put_request(osd_req);
 }
 
+/*
+ * A write request to a clone image must first check to see if the
+ * target object exists (using a STAT object operation).  If it
+ * exists, the write proceeds as it would for a non-layered image
+ * object write.  If the target does not exist, a read from the
+ * parent image must be initiated.
+ *
+ * This function creates the first (STAT) request in that sequence.
+ *
+ * I know, this name is ridiculously long.
+ */
+struct ceph_osd_request *rbd_img_obj_layered_write_osd_req_create(
+				struct rbd_img_request *img_request,
+				struct rbd_obj_request *obj_request)
+{
+	struct ceph_osd_request	*osd_req = NULL;
+	struct ceph_osd_req_op *op;
+	struct page **pages;
+	int page_count;
+
+	/* Get a page to hold the result info */
+
+	page_count = calc_pages_for(0, sizeof (struct osd_op_stat_result));
+	pages = ceph_alloc_page_vector(page_count, GFP_KERNEL);
+	if (IS_ERR(pages))
+		return NULL;	/* ENOMEM */
+
+	op = rbd_osd_req_op_create(CEPH_OSD_OP_STAT);
+	if (!op)
+		goto out_err;
+
+	osd_req = rbd_osd_req_create(img_request->rbd_dev,
+						false, obj_request, op);
+	rbd_osd_req_op_destroy(op);
+	if (!osd_req)
+		goto out_err;
+
+	return osd_req;
+out_err:
+	ceph_release_page_vector(pages, page_count);
+
+	return NULL;
+}
+
 struct ceph_osd_request *rbd_img_obj_osd_req_create(
 				struct rbd_img_request *img_request,
 				struct rbd_obj_request *obj_request)
@@ -1590,6 +1692,9 @@ static void rbd_obj_request_destroy(struct kref *kref)
 
 	if (obj_request->osd_req)
 		rbd_osd_req_destroy(obj_request->osd_req);
+
+	if (obj_req_stat(obj_request))
+		rbd_obj_request_put(obj_request->obj_request);
 
 	rbd_assert(obj_request_type_valid(obj_request->type));
 	switch (obj_request->type) {
@@ -1824,19 +1929,102 @@ out:
 		rbd_img_request_complete(img_request);
 }
 
+/*
+ * This is called for an image object write request when the image
+ * is layered (has a parent image) and we don't know whether the
+ * target object exists.  A new STAT object request is created and
+ * submitted to determine whether the target object exists.  That
+ * object request will refer back to the original one in its
+ * obj_request field.
+ *
+ * If the object does exist then the original write request is
+ * submitted by the STAT object request callback.
+ *
+ * Otherwise the callback needs to read the parent image.
+ */
+static int rbd_obj_exists_submit(struct rbd_obj_request *obj_request)
+{
+	struct rbd_img_request *img_request;
+	struct rbd_device *rbd_dev;
+	struct rbd_obj_request *stat_request;
+	struct ceph_osd_client *osdc;
+	struct ceph_osd_req_op *op;
+	struct page **pages;
+	int page_count;
+	int ret;
+
+	rbd_assert(obj_req_img_data(obj_request));
+	img_request = obj_request->img_request;
+	rbd_assert(img_request != NULL);
+	rbd_assert(img_req_layered(img_request));
+	rbd_assert(img_req_write(img_request));
+	rbd_dev = img_request->rbd_dev;
+
+	/*
+	 * A stat call is a read operation but it doesn't involve
+	 * object data (so no offset or length).  Allocate a page to
+	 * hold the data returned if successful.
+	 */
+	page_count = calc_pages_for(0, sizeof (struct osd_op_stat_result));
+	pages = ceph_alloc_page_vector(page_count, GFP_KERNEL);
+	if (IS_ERR(pages))
+		return PTR_ERR(pages);
+
+	stat_request = rbd_obj_request_create(obj_request->object_name, 0, 0,
+							OBJ_REQUEST_PAGES);
+	if (!stat_request)
+		goto out_err;
+
+	stat_request->pages = pages;
+	stat_request->page_count = page_count;
+	rbd_obj_request_get(obj_request);
+	stat_request->obj_request = obj_request;
+	obj_req_stat_set(stat_request);
+
+	op = rbd_osd_req_op_create(CEPH_OSD_OP_STAT);
+	if (!op)
+		goto out_err;
+	stat_request->osd_req = rbd_osd_req_create(rbd_dev, false,
+						stat_request, op);
+	rbd_osd_req_op_destroy(op);
+	if (!stat_request->osd_req)
+		goto out_err;
+
+	osdc = &rbd_dev->rbd_client->client->osdc;
+	ret = rbd_obj_request_submit(osdc, stat_request);
+	if (ret)
+		rbd_obj_request_put(stat_request);
+
+	return ret;
+out_err:
+	if (stat_request)
+		rbd_obj_request_put(stat_request);
+	else
+		ceph_release_page_vector(pages, page_count);
+
+	return -ENOMEM;
+}
+
 static int rbd_img_request_submit(struct rbd_img_request *img_request)
 {
 	struct rbd_device *rbd_dev = img_request->rbd_dev;
 	struct ceph_osd_client *osdc = &rbd_dev->rbd_client->client->osdc;
 	struct rbd_obj_request *obj_request;
+	bool read = !img_req_write(img_request);
+	bool layered = img_req_layered(img_request);
 
 	for_each_obj_request(img_request, obj_request) {
 		int ret;
 
-		obj_request->callback = rbd_img_obj_callback;
-		ret = rbd_obj_request_submit(osdc, obj_request);
+		if (read || !layered || obj_req_exists(obj_request)) {
+			obj_request->callback = rbd_img_obj_callback;
+			ret = rbd_obj_request_submit(osdc, obj_request);
+		} else {
+			ret = rbd_obj_exists_submit(obj_request);
+		}
 		if (ret)
 			return ret;
+
 		/*
 		 * The image request has its own reference to each
 		 * of its object requests, so we can safely drop the
