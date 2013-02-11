@@ -174,10 +174,15 @@ enum obj_request_type {
 	OBJ_REQUEST_NODATA, OBJ_REQUEST_BIO, OBJ_REQUEST_PAGES
 };
 
+enum obj_req_flags {
+	OBJ_REQ_DONE,		/* completion flag: not done = 0, done = 1 */
+};
+
 struct rbd_obj_request {
 	const char		*object_name;
 	u64			offset;		/* object start byte */
 	u64			length;		/* bytes from offset */
+	unsigned long		flags;
 
 	struct rbd_img_request	*img_request;
 	u64			img_offset;	/* image relative offset */
@@ -198,13 +203,22 @@ struct rbd_obj_request {
 	u64			xferred;	/* bytes transferred */
 	u64			version;
 	s32			result;
-	atomic_t		done;
 
 	rbd_obj_callback_t	callback;
 	struct completion	completion;
 
 	struct kref		kref;
 };
+
+/*
+ * The default/initial value for all object request flags is 0.  For
+ * each flag, once its value is set to 1 it is never reset to 0
+ * again.
+ */
+#define obj_req_done_set(obj_req) \
+	set_bit(OBJ_REQ_DONE, &(obj_req)->flags)
+#define obj_req_done(obj_req) \
+	test_bit(OBJ_REQ_DONE, &(obj_req)->flags)
 
 enum img_req_flags {
 	IMG_REQ_WRITE,		/* I/O direction: read = 0, write = 1 */
@@ -1259,22 +1273,16 @@ static int rbd_obj_request_wait(struct rbd_obj_request *obj_request)
 	return wait_for_completion_interruptible(&obj_request->completion);
 }
 
-static void obj_request_done_init(struct rbd_obj_request *obj_request)
-{
-	atomic_set(&obj_request->done, 0);
-	smp_wmb();
-}
-
 static void obj_request_done_set(struct rbd_obj_request *obj_request)
 {
-	atomic_set(&obj_request->done, 1);
+	obj_req_done_set(obj_request);
 	smp_wmb();
 }
 
 static bool obj_request_done_test(struct rbd_obj_request *obj_request)
 {
 	smp_rmb();
-	return atomic_read(&obj_request->done) != 0;
+	return obj_req_done(obj_request) != 0;
 }
 
 static void rbd_osd_trivial_callback(struct rbd_obj_request *obj_request,
@@ -1504,10 +1512,10 @@ static struct rbd_obj_request *rbd_obj_request_create(const char *object_name,
 	obj_request->object_name = memcpy(name, object_name, size);
 	obj_request->offset = offset;
 	obj_request->length = length;
+	obj_request->flags = 0;
 	obj_request->which = BAD_WHICH;
 	obj_request->type = type;
 	INIT_LIST_HEAD(&obj_request->links);
-	obj_request_done_init(obj_request);
 	init_completion(&obj_request->completion);
 	kref_init(&obj_request->kref);
 
