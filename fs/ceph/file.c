@@ -331,10 +331,7 @@ static int striped_read(struct inode *inode,
 	io_align = off & ~PAGE_MASK;
 
 more:
-	if (o_direct)
-		page_align = (pos - io_align + buf_align) & ~PAGE_MASK;
-	else
-		page_align = pos & ~PAGE_MASK;
+	page_align = o_direct ? buf_align : io_align;
 	this_len = left;
 	ret = ceph_osdc_readpages(&fsc->client->osdc, ceph_vino(inode),
 				  &ci->i_layout, pos, &this_len,
@@ -526,15 +523,10 @@ more:
 	io_align = pos & ~PAGE_MASK;
 	buf_align = (unsigned long)data & ~PAGE_MASK;
 	len = left;
-	if (file->f_flags & O_DIRECT) {
-		/* write from beginning of first page, regardless of
-		   io alignment */
-		page_align = (pos - io_align + buf_align) & ~PAGE_MASK;
-		num_pages = calc_pages_for((unsigned long)data, len);
-	} else {
-		page_align = pos & ~PAGE_MASK;
-		num_pages = calc_pages_for(pos, len);
-	}
+
+	/* write from beginning of first page, regardless of io alignment */
+	page_align = file->f_flags & O_DIRECT ? buf_align : io_align;
+	num_pages = calc_pages_for(page_align, len);
 	req = ceph_osdc_new_request(&fsc->client->osdc, &ci->i_layout,
 				    ceph_vino(inode), pos, &len,
 				    CEPH_OSD_OP_WRITE, flags,
